@@ -28,6 +28,7 @@ RESERVATION_NOT_FOUND_CODE = 400620389
 
 logger = get_logger(__name__)
 
+
 def random_sleep_duration(min_duration: float, max_duration: float) -> float:
     return random.uniform(min_duration, max_duration)
 
