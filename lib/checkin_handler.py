@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import signal
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from multiprocessing import Lock, Process
 from typing import TYPE_CHECKING, Any
@@ -157,14 +159,8 @@ class CheckInHandler:
 
     def _attempt_check_in(self) -> JSON:
         """
-        Keeps attempting to check in until all flights are checked in. This should
-        succeed after one attempt for non-same-day flights, but is necessary for
-        same-day flights.
-
-        For same-day flights: since the check-in is started early, the submission will
-        go through for the previous flight, but the flight attached to this handler will
-        not have been checked in yet. Therefore, this function keeps attempting to check
-        in until both flights have checked in.
+        Attempts to check in once for all flights using parallel threads, staggered by 2 seconds.
+        Stops all threads instantly as soon as one succeeds.
         """
         logger.debug("Attempting to check in")
 
@@ -173,23 +169,52 @@ class CheckInHandler:
             logger.debug("Checking in same-day flight")
             expected_flights = 2
 
-        attempts = 0
-        while attempts < MAX_CHECK_IN_ATTEMPTS:
-            attempts += 1
+        stop_event = threading.Event()
+        max_threads = 5
+        futures = {}
 
-            reservation = self._check_in_to_flight()
-            flights = reservation["checkInConfirmationPage"]["flights"]
-            if len(flights) >= expected_flights:
-                logger.debug("Successfully checked in after %d attempts", attempts)
-                return reservation
+        def check_in_with_thread(thread_name: str) -> JSON:
+            if stop_event.is_set():
+                logger.debug("%s exiting early", thread_name)
+                return None
 
-            logger.debug(
-                "Same-day flight has not been checked in yet. Waiting 1 second and trying again"
-            )
-            time.sleep(1)
+            logger.debug("%s starting check-in attempt", thread_name)
+            try:
+                reservation = self._check_in_to_flight()
+                flights = reservation["checkInConfirmationPage"]["flights"]
+                if len(flights) >= expected_flights:
+                    logger.debug("%s successfully checked in", thread_name)
+                    stop_event.set()  # Signal all threads to stop
+                    return reservation
+            except RequestError as err:
+                logger.debug("%s failed to check in: %s", thread_name, err)
 
-        logger.debug("Same-day flight failed to check in after %d attempts", MAX_CHECK_IN_ATTEMPTS)
-        raise RequestError("Too many attempts during check-in")
+            return None
+
+        with ThreadPoolExecutor(max_threads) as executor:
+            start_time = time.time()
+            for i in range(max_threads):
+                if stop_event.is_set():
+                    break  # Skip launching new threads if one succeeded
+                thread_name = f"Thread-{i + 1}"
+                future = executor.submit(check_in_with_thread, thread_name)
+                futures[future] = thread_name
+
+                # Ensure stagger only happens if no thread succeeded yet
+                while time.time() - start_time < (2 * (i + 1)):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(0.1)  # Small check-in intervals to exit quickly
+
+            for future in as_completed(futures):
+                reservation = future.result()
+                if reservation:
+                    logger.debug("Check-in succeeded, canceling remaining threads.")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    return reservation
+
+        logger.debug("All parallel check-in attempts failed.")
+        raise RequestError("All parallel check-in attempts failed.")
 
     def _check_in_to_flight(self) -> JSON:
         """
@@ -206,8 +231,6 @@ class CheckInHandler:
         site = CHECKIN_URL + self.flight.confirmation_number
 
         logger.debug("Making first POST request to check in")
-        time.sleep(2)
-
         # Don't randomly sleep during the check-in requests to have them go through more quickly
         response = make_request("POST", site, headers, info, random_sleep=False)
 
