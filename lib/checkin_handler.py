@@ -5,17 +5,23 @@ import signal
 import time
 from datetime import datetime, timedelta
 from multiprocessing import Lock, Process
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any
 
-from .flight import Flight
 from .log import get_logger
-from .utils import RequestError, get_current_time, make_request
+from .utils import (
+    AirportCheckInError,
+    DriverTimeoutError,
+    RequestError,
+    get_current_time,
+    make_request,
+)
 
 if TYPE_CHECKING:
     from .checkin_scheduler import CheckInScheduler
+    from .flight import Flight
 
 # Type alias for JSON
-JSON = Dict[str, Any]
+JSON = dict[str, Any]
 
 CHECKIN_URL = "mobile-air-operations/v1/mobile-air-operations/page/check-in/"
 MANUAL_CHECKIN_URL = "https://mobile.southwest.com/check-in"
@@ -71,8 +77,8 @@ class CheckInHandler:
         logger.debug("Process with PID %d successfully terminated", self.pid)
 
     def _set_check_in(self) -> None:
-        # Starts to check in five seconds early in case the Southwest server is ahead of your server
-        checkin_time = self.flight.departure_time - timedelta(days=1, seconds=5)
+        # Check-in is 24 hours before the flight departs
+        checkin_time = self.flight.departure_time - timedelta(days=1)
 
         try:
             self._wait_for_check_in(checkin_time)
@@ -100,16 +106,20 @@ class CheckInHandler:
             logger.debug("Acquiring lock...")
             with self.lock:
                 logger.debug("Lock acquired")
-                self.checkin_scheduler.refresh_headers()
+                try:
+                    self.checkin_scheduler.refresh_headers()
+                except DriverTimeoutError:
+                    logger.debug("Timeout while refreshing headers before check-in")
+                    self.notification_handler.timeout_before_checkin(self.flight)
 
             logger.debug("Lock released")
+            current_time = get_current_time()
 
-        current_time = get_current_time()
         sleep_time = (checkin_time - current_time).total_seconds()
         logger.debug("Sleeping until check-in: %d seconds...", sleep_time)
         time.sleep(sleep_time)
 
-    def _safe_sleep(self, total_sleep_time: int) -> None:
+    def _safe_sleep(self, total_sleep_time: float) -> None:
         """
         If the total sleep time is too long, an overflow error could occur.
         Therefore, the script will continuously sleep in two week periods
@@ -132,6 +142,10 @@ class CheckInHandler:
 
         try:
             reservation = self._attempt_check_in()
+        except AirportCheckInError:
+            logger.debug("Failed to check in. Airport check-in is required")
+            self.notification_handler.airport_checkin_required(self.flight)
+            return
         except RequestError as err:
             logger.debug("Failed to check in. Error: %s. Exiting", err)
             self.notification_handler.failed_checkin(err, self.flight)
@@ -153,7 +167,11 @@ class CheckInHandler:
         in until both flights have checked in.
         """
         logger.debug("Attempting to check in")
-        expected_flights = 2 if self.flight.is_same_day else 1
+
+        expected_flights = 1
+        if self.flight.is_same_day:
+            logger.debug("Checking in same-day flight")
+            expected_flights = 2
 
         attempts = 0
         while attempts < MAX_CHECK_IN_ATTEMPTS:
@@ -175,22 +193,25 @@ class CheckInHandler:
 
     def _check_in_to_flight(self) -> JSON:
         """
-        First, make a GET request to get the needed check-in information. Then, make
-        a POST request to submit the check in.
+        First, initiate a POST request to get the needed check-in information. Subsequently, execute
+        another POST request to submit the check in.
         """
         headers = self.checkin_scheduler.headers
         info = {
-            "first-name": self.first_name,
-            "last-name": self.last_name,
+            "firstName": self.first_name,
+            "lastName": self.last_name,
+            "passengerSearchToken": "",
+            "recordLocator": self.flight.confirmation_number,
         }
         site = CHECKIN_URL + self.flight.confirmation_number
 
-        logger.debug("Making GET request to check in")
-        response = make_request("GET", site, headers, info, random_sleep=True)
+        logger.debug("Making first POST request to check in")
+        # Don't randomly sleep during the check-in requests to have them go through more quickly
+        response = make_request("POST", site, headers, info, random_sleep=False)
 
         info = response["checkInViewReservationPage"]["_links"]["checkIn"]
         site = f"mobile-air-operations{info['href']}"
 
-        logger.debug("Making POST request to check in")
-        reservation = make_request("POST", site, headers, info["body"])
+        logger.debug("Making second POST request to check in")
+        reservation = make_request("POST", site, headers, info["body"], random_sleep=False)
         return reservation

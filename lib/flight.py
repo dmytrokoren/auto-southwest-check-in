@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import zoneinfo
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
-import pytz
-
-JSON = Dict[str, Any]
+JSON = dict[str, Any]
 
 TZ_FILE_PATH = "utils/airport_timezones.json"
 
@@ -20,12 +19,15 @@ class Flight:
     The flight time is automatically translated from the flight's local timezone to UTC.
     """
 
-    def __init__(self, flight_info: Dict[str, Any], confirmation_number: str) -> None:
+    def __init__(self, flight_info: JSON, reservation_info: JSON, confirmation_number: str) -> None:
         self.confirmation_number = confirmation_number
         self.departure_airport = flight_info["departureAirport"]["name"]
         self.destination_airport = flight_info["arrivalAirport"]["name"]
         self.flight_number = self._get_flight_number(flight_info["flights"])
         self.is_same_day = False
+
+        # Cached for use by the fare checker
+        self.reservation_info = reservation_info
 
         # Track to notify the user of filling out their passport information.
         # Southwest only fills the country's value for international flights
@@ -64,19 +66,28 @@ class Flight:
         tz_file = project_dir / TZ_FILE_PATH
         airport_timezones = json.loads(tz_file.read_text())
 
-        airport_timezone = pytz.timezone(airport_timezones[airport_code])
+        airport_timezone = zoneinfo.ZoneInfo(airport_timezones[airport_code])
         return airport_timezone
 
     def _convert_to_utc(self, flight_date: str, airport_timezone: Any) -> datetime:
         flight_date = datetime.strptime(flight_date, "%Y-%m-%d %H:%M")
-        self._local_departure_time = airport_timezone.localize(flight_date)
+        self._local_departure_time = flight_date.replace(tzinfo=airport_timezone)
 
-        utc_time = self._local_departure_time.astimezone(timezone.utc).replace(tzinfo=None)
+        utc_time = self._local_departure_time.astimezone(timezone.utc)
         return utc_time
 
     def _get_flight_number(self, flights: JSON) -> str:
+        """
+        Formats the flight number in the way that the fare checker expects it, which is with the
+        'WN' prefix removed and a slash separating each number with a zero-width space on either
+        side.
+        """
         flight_number = ""
         for flight in flights:
-            flight_number += flight["number"] + "\u200b/\u200b"
+            # Remove the 'WN' prefix from each flight number
+            flight_number += flight["number"].removeprefix("WN")
+            # Add a slash with a zero-width space on either side
+            flight_number += "\u200b/\u200b"
 
-        return flight_number.rstrip("\u200b/\u200b")
+        # Remove any slashes and zero-width spaces from the end
+        return flight_number.rstrip("/\u200b")

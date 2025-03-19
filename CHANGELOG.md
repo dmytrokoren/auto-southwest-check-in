@@ -3,6 +3,100 @@ When upgrading to a new version, make sure to follow the directions under the "U
 If there is no "Upgrading" header for that version, no post-upgrade actions need to be performed.
 
 
+## 8.3 (2025-03-10)
+### Improvements
+- Set local timezone in Docker container to avoid 403/429 errors
+([#342](https://github.com/jdholtz/auto-southwest-check-in/pull/342) by [@dmytrokoren](https://github.com/dmytrokoren))
+    - The idea to set the timezone in Docker comes from [@yunhao-jiang](https://github.com/yunhao-jiang)
+- The notification configuration has been redone. This allows users to specify the notification
+level and time format individually for each service. See the [notification configuration](CONFIGURATION.md#notifications)
+for more information as well as how to update your configuration file
+([#328](https://github.com/jdholtz/auto-southwest-check-in/pull/328))
+- Use a specific error message when handling canceled reservations
+- [Development] [Ruff](https://docs.astral.sh/ruff/) is now used to lint and format the project
+
+### Upgrading
+- Due to the changes in the notification configuration, you will need to update your configuration file to the new
+format. See the [notification configuration](CONFIGURATION.md#notifications) for how to do so
+- Upgrade the dependencies to the latest versions by running `pip install -r requirements.txt`
+
+
+## 8.2 (2025-01-12)
+### New Features
+- A [JSON Schema](https://json-schema.org/) definition was added to help users validate their configuration files through updates
+([#320](https://github.com/jdholtz/auto-southwest-check-in/pull/320) by [@kaveet](https://github.com/kaveet))
+    - If you want to use this schema, you'll need to add the following line to your `config.json` file:
+    `"$schema": "config.schema.json"`
+- Official support for Python 3.13
+    - Support for Python 3.8 has been dropped
+
+### Improvements
+- Logins that fail due to 'Too Many Requests' or 'Internal Server Error' errors will now be retried once
+([#311](https://github.com/jdholtz/auto-southwest-check-in/pull/311) by [@dmytrokoren](https://github.com/dmytrokoren))
+
+### Upgrading
+- Upgrade the dependencies to the latest versions by running `pip install -r requirements.txt`
+- The script no longer works on Python 3.8. If you are using Python 3.8, you will need to upgrade to
+a newer version
+
+
+## 8.1 (2024-11-03)
+### New Features
+- Fare drops can now be checked for all flights on the same day or all nonstop flights on the same day
+([#303](https://github.com/jdholtz/auto-southwest-check-in/pulls/303))
+    - The following values in your `check_fares` configuration will enable this feature
+        - `same_day` will check all flights on the same day
+        - `same_day_nonstop` will check all nonstop flights on the same day
+    - Detailed information can be found in the [check_fares documentation](CONFIGURATION.md#check-fares)
+
+### Improvements
+- Potentially speed up the check-in process
+    - Check-ins now start exactly 24 hours before a flight (instead of 24 hours and 5 seconds)
+- Improve detection evasion in the Docker image by using a virtual display
+([#307](https://github.com/jdholtz/auto-southwest-check-in/pull/307) by [@dmytrokoren](https://github.com/dmytrokoren))
+
+### Bug Fixes
+- Fix headers not being retrieved, causing a webdriver timeout
+([#314](https://github.com/jdholtz/auto-southwest-check-in/pulls/314) by [@sephamorr](https://github.com/sephamorr))
+
+### Upgrading
+- Upgrade the dependencies to the latest versions by running `pip install -r requirements.txt`
+
+
+## 8.0 (2024-08-17)
+### New Features
+- A new [notification level](CONFIGURATION.md#notification-level) for notices (non-critical warnings) was added, which includes
+driver timeouts and Too Many Requests errors during logins. This is the lowest notification level offered
+    - The default configuration is still the same. Refer to the [notification level configuration](CONFIGURATION.md#notification-level)
+    for more details on the levels
+    - If you have manually set `notification_level` in your config.json, see the "Upgrading" header for how to adjust it for the
+    new notification levels
+
+### Improvements
+- Mitigations for 403 and 429 errors were added to significantly improve Docker and server environments as well as
+checking many accounts and reservations at once
+([#274](https://github.com/jdholtz/auto-southwest-check-in/pull/274) by [@dmytrokoren](https://github.com/dmytrokoren))
+- Fare checks now run faster due to caching a flight's reservation information from previous queries to Southwest's API
+- The script now runs as a non-root user in Docker to improve a container's security
+- Error messages during check-ins and reservation retrievals relating to reservation/passenger not found, invalid confirmation number
+length, and airport check-in required are more detailed
+- Add a backup NTP server to make retrieving time much more reliable
+([#284](https://github.com/jdholtz/auto-southwest-check-in/pull/284) by [@dmytrokoren](https://github.com/dmytrokoren))
+
+### Bug Fixes
+- Adapt check-ins to use Southwest's new API
+([#282](https://github.com/jdholtz/auto-southwest-check-in/pull/282) by [@dmytrokoren](https://github.com/dmytrokoren))
+- Fix the webdriver failing to start when using Docker
+([#291](https://github.com/jdholtz/auto-southwest-check-in/pull/291) by [@ne0ark](https://github.com/ne0ark))
+
+### Upgrading
+- If you manually set `notification_level` in your configuration, it will need to be adjusted accordingly.
+    - If it was set to `2` (error messages only), it needs to be set to `3`
+    - If it was set to `1` (all messages), it needs to be set to `2`
+    - Refer to the [notification level configuration](CONFIGURATION.md#notification-level) for more details on the levels
+- Upgrade the dependencies to the latest versions by running `pip install -r requirements.txt`
+
+
 ## 7.5 (2024-06-07)
 ### New Features
 - Times are now fetched from an NTP server when possible ([#235](https://github.com/jdholtz/auto-southwest-check-in/issues/235))

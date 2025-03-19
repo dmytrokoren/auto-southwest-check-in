@@ -3,47 +3,57 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 import sys
-from typing import List
+
+import requests
 
 from lib import log
 
-from .config import GlobalConfig, ReservationConfig
+from .config import IS_DOCKER, GlobalConfig, ReservationConfig
 from .reservation_monitor import AccountMonitor, ReservationMonitor
 
+IP_TIMEZONE_URL = "https://ipinfo.io/timezone"
 LOG_FILE = "logs/auto-southwest-check-in.log"
 
 logger = log.get_logger(__name__)
 
 
-def get_notification_urls(config: GlobalConfig) -> List[str]:
-    """
-    Get all notification URLS in the global config, each account, and each
-    reservation. Removes duplicates so notifications are not sent twice to
-    the same source.
-    """
-    notification_urls = config.notification_urls
-
-    for account in config.accounts:
-        notification_urls.extend(account.notification_urls)
-
-    for reservation in config.reservations:
-        notification_urls.extend(reservation.notification_urls)
-
-    # Remove duplicates
-    notification_urls = list(set(notification_urls))
-    return notification_urls
+def get_timezone() -> str:
+    """Fetches the local timezone based on the system's IP address"""
+    try:
+        logger.debug("Fetching local timezone")
+        response = requests.get(IP_TIMEZONE_URL, timeout=5)
+        response.raise_for_status()
+        return response.text.strip()
+    except requests.RequestException:
+        logger.debug("Timezone request failed, reverting to UTC")
+        return "UTC"
 
 
 def test_notifications(config: GlobalConfig) -> None:
-    notification_urls = get_notification_urls(config)
+    """
+    Send a test notification to all configured sources. The notification configs for every account
+    and reservation are merged to ensure only one test notification is sent to each source, even
+    if a URL is specified for multiple accounts or reservations.
+    """
+    for account in config.accounts:
+        config.merge_notification_config(account)
+
+    for reservation in config.reservations:
+        config.merge_notification_config(reservation)
 
     new_config = ReservationConfig()
-    new_config.notification_urls = notification_urls
+    new_config.notifications = config.notifications
     reservation_monitor = ReservationMonitor(new_config)
 
-    logger.info("Sending test notifications to %d sources", len(notification_urls))
+    logger.info("Sending test notifications to %d sources", len(new_config.notifications))
     reservation_monitor.notification_handler.send_notification("This is a test message")
+
+
+def pluralize(word: str, count: int) -> str:
+    """Pluralize a word to improve grammar for printed messages"""
+    return word if count == 1 else word + "s"
 
 
 def set_up_accounts(config: GlobalConfig, lock: multiprocessing.Lock) -> None:
@@ -58,7 +68,7 @@ def set_up_reservations(config: GlobalConfig, lock: multiprocessing.Lock) -> Non
         reservation_monitor.start()
 
 
-def set_up_check_in(arguments: List[str]) -> None:
+def set_up_check_in(arguments: list[str]) -> None:
     """
     Initialize reservation and account monitoring based on the configuration
     and arguments passed in
@@ -87,9 +97,16 @@ def set_up_check_in(arguments: List[str]) -> None:
         logger.error("Invalid arguments. For more information, try '--help'")
         sys.exit(2)
 
-    print(
-        f"Monitoring {len(config.accounts)} accounts and {len(config.reservations)} reservations\n"
+    num_accounts = len(config.accounts)
+    num_reservations = len(config.reservations)
+    logger.info(
+        "Monitoring %s %s and %s %s\n",
+        num_accounts,
+        pluralize("account", num_accounts),
+        num_reservations,
+        pluralize("reservation", num_reservations),
     )
+
     lock = multiprocessing.Lock()
     set_up_accounts(config, lock)
     set_up_reservations(config, lock)
@@ -100,9 +117,14 @@ def set_up_check_in(arguments: List[str]) -> None:
         process.join()
 
 
-def main(arguments: List[str], version: str) -> None:
+def main(arguments: list[str], version: str) -> None:
     log.init_main_logging()
     logger.debug("Auto-Southwest Check-In %s", version)
+
+    if IS_DOCKER:
+        # Setting timezone to avoid Southwest fingerprinting (based on browser timezone)
+        timezone = get_timezone()
+        os.environ["TZ"] = timezone
 
     # Remove flags now that they are not needed (and will mess up parsing)
     flags_to_remove = ["--debug-screenshots", "-v", "--verbose"]

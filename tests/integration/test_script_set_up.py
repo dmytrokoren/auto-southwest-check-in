@@ -2,7 +2,7 @@
 
 import json
 import logging
-from typing import Iterator
+from collections.abc import Iterator
 
 import pytest
 from pytest_mock import MockerFixture
@@ -14,6 +14,8 @@ from lib import main
 @pytest.fixture(autouse=True)
 def logger(mocker: MockerFixture) -> Iterator[logging.Logger]:
     logger = logging.getLogger("lib")
+    # Make sure no file system changes are done
+    mocker.patch("pathlib.Path.mkdir")
     # Make sure logs aren't written to a file
     mock_file_handler = mocker.patch("logging.handlers.RotatingFileHandler")
     mock_file_handler.return_value.level = logging.DEBUG
@@ -25,7 +27,7 @@ def logger(mocker: MockerFixture) -> Iterator[logging.Logger]:
 
 @pytest.fixture(autouse=True)
 def mock_read_config(mocker: MockerFixture) -> None:
-    # Don't ever read the actually config file. Will be mocked within the test
+    # Don't ever read the actual config file. Will be mocked within the test
     # if a certain config needs to be used
     mocker.patch("pathlib.Path.read_text", side_effect=FileNotFoundError)
 
@@ -50,12 +52,12 @@ def test_help_is_printed(flag: str, capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_notifications_are_tested(mocker: MockerFixture) -> None:
     config = {
-        "notification_urls": ["test_global_1", "test_global_2"],
+        "notifications": [{"url": "test_global_1"}, {"url": "test_global_2"}],
         "accounts": [
             {
                 "username": "test_user",
                 "password": "test_pass",
-                "notification_urls": "test_account_1",
+                "notifications": [{"url": "test_account_1"}],
             },
         ],
         "reservations": [
@@ -63,7 +65,7 @@ def test_notifications_are_tested(mocker: MockerFixture) -> None:
                 "confirmationNumber": "TEST",
                 "firstName": "Mererid",
                 "lastName": "Marian",
-                "notification_urls": ["test_global_1", "test_reservation_1"],
+                "notifications": [{"url": "test_global_1"}, {"url": "test_reservation_1"}],
             },
         ],
     }
@@ -75,14 +77,14 @@ def test_notifications_are_tested(mocker: MockerFixture) -> None:
     with pytest.raises(SystemExit):
         main.main(["--test-notifications"], "test_version")
 
-    mock_apprise.assert_called_once()
+    assert mock_apprise.call_count == 4
+    assert mock_apprise.return_value.notify.call_count == 4
 
+    # Ensure all URLs are sent one notification
     expected_urls = ["test_global_1", "test_global_2", "test_account_1", "test_reservation_1"]
-    called_urls = mock_apprise.call_args[0][0]
-
-    assert len(called_urls) == 4
-    assert all(url in called_urls for url in expected_urls)
-    mock_apprise.return_value.notify.assert_called_once()
+    for call in mock_apprise.call_args_list:
+        assert call[0][0] in expected_urls
+        expected_urls.remove(call[0][0])
 
 
 @pytest.mark.parametrize("verbose_flag", ["-v", "--verbose"])
@@ -95,7 +97,7 @@ def test_account_from_command_line_with_verbose(
     args = ["test_user", "test_pass", verbose_flag]
     # sys.argv is used instead of the args passed in to the log module (it also would have
     # southwest.py prepended to it in real use)
-    mocker.patch("sys.argv", ["test_file"] + args)
+    mocker.patch("sys.argv", ["test_file", *args])
 
     main.main(args, "test_version")
 
@@ -114,7 +116,7 @@ def test_reservation_from_command_line_without_verbose(
     args = ["TEST", "Charli", "Silvester"]
     # sys.argv is used instead of the args passed in to the log module (it also would have
     # southwest.py prepended to it in real use)
-    mocker.patch("sys.argv", ["test_file"] + args)
+    mocker.patch("sys.argv", ["test_file", *args])
 
     main.main(args, "test_version")
 

@@ -1,31 +1,36 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
 import time
-from typing import TYPE_CHECKING, Any, Dict, List
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
+from sbvirtualdisplay import Display
 from seleniumbase import Driver
 from seleniumbase.fixtures import page_actions as seleniumbase_actions
 
+from .config import IS_DOCKER
 from .log import LOGS_DIRECTORY, get_logger
-from .utils import LoginError, random_sleep_duration
+from .utils import DriverTimeoutError, LoginError, random_sleep_duration
 
 if TYPE_CHECKING:
     from .checkin_scheduler import CheckInScheduler
     from .reservation_monitor import AccountMonitor
 
 BASE_URL = "https://mobile.southwest.com"
+CHECKIN_URL = BASE_URL + "/air/check-in/"
 LOGIN_URL = BASE_URL + "/api/security/v4/security/token"
 TRIPS_URL = BASE_URL + "/api/mobile-misc/v1/mobile-misc/page/upcoming-trips"
-HEADERS_URL = [BASE_URL + "/api/chase/v2/chase/offers"]
+HEADERS_URL = BASE_URL + "/api/mobile-air-booking/v1/mobile-air-booking/feature/shopping-details"
 
 # Southwest's code when logging in with the incorrect information
 INVALID_CREDENTIALS_CODE = 400518024
 
-JSON = Dict[str, Any]
+WAIT_TIMEOUT_SECS = 180
+
+JSON = dict[str, Any]
 
 logger = get_logger(__name__)
 
@@ -50,6 +55,7 @@ class WebDriver:
         self.checkin_scheduler = checkin_scheduler
         self.headers_set = False
         self.debug_screenshots = self._should_take_screenshots()
+        self.display = None
 
         # For account login
         self.login_request_id = None
@@ -72,7 +78,7 @@ class WebDriver:
     def _take_debug_screenshot(self, driver: Driver, name: str) -> None:
         """Take a screenshot of the browser and save the image as 'name' in LOGS_DIRECTORY"""
         if self.debug_screenshots:
-            driver.save_screenshot(os.path.join(LOGS_DIRECTORY, name))
+            driver.save_screenshot(Path(LOGS_DIRECTORY) / name)
 
     def set_headers(self) -> None:
         """
@@ -86,9 +92,9 @@ class WebDriver:
         self._wait_for_attribute("headers_set")
         self._take_debug_screenshot(driver, "post_headers.png")
 
-        driver.quit()
+        self._quit_driver(driver)
 
-    def get_reservations(self, account_monitor: AccountMonitor) -> List[JSON]:
+    def get_reservations(self, account_monitor: AccountMonitor) -> list[JSON]:
         """
         Logs into the account being monitored to retrieve a list of reservations. Since
         valid headers are produced, they are also grabbed and updated in the check-in scheduler.
@@ -123,7 +129,7 @@ class WebDriver:
         # instead of requesting again later
         reservations = self._fetch_reservations(driver)
 
-        driver.quit()
+        self._quit_driver(driver)
         return reservations
 
     def _get_driver(self) -> Driver:
@@ -131,26 +137,28 @@ class WebDriver:
         browser_path = self.checkin_scheduler.reservation_monitor.config.browser_path
 
         driver_version = "mlatest"
-        if os.environ.get("AUTO_SOUTHWEST_CHECK_IN_DOCKER") == "1":
-            # This environment variable is set in the Docker image. Makes sure a new driver
-            # is not downloaded as the Docker image already has the correct driver
+        if IS_DOCKER:
+            self._start_display()
+            # Make sure a new driver is not downloaded as the Docker image
+            # already has the correct driver
             driver_version = "keep"
 
         driver = Driver(
             binary_location=browser_path,
             driver_version=driver_version,
-            headless=True,
+            headed=IS_DOCKER,
+            headless=not IS_DOCKER,
             uc_cdp_events=True,
             undetectable=True,
-            is_mobile=True,
+            incognito=True,
         )
         logger.debug("Using browser version: %s", driver.caps["browserVersion"])
 
         driver.add_cdp_listener("Network.requestWillBeSent", self._headers_listener)
 
-        logger.debug("Loading Southwest home page (this may take a moment)")
-        driver.open(BASE_URL)
-        driver.js_click("(//div[@data-qa='placement-link'])[2]")
+        logger.debug("Loading Southwest check-in page (this may take a moment)")
+        driver.open(CHECKIN_URL)
+        self._take_debug_screenshot(driver, "after_page_load.png")
         return driver
 
     def _headers_listener(self, data: JSON) -> None:
@@ -159,7 +167,7 @@ class WebDriver:
         in the checkin_scheduler.
         """
         request = data["params"]["request"]
-        if request["url"] in HEADERS_URL and not self.headers_set:
+        if request["url"] == HEADERS_URL:
             self.checkin_scheduler.headers = self._get_needed_headers(request["headers"])
             self.headers_set = True
 
@@ -178,9 +186,19 @@ class WebDriver:
             self.trips_request_id = data["params"]["requestId"]
 
     def _wait_for_attribute(self, attribute: str) -> None:
-        logger.debug("Waiting for %s to be set", attribute)
-        while not getattr(self, attribute):
-            time.sleep(0.5)
+        logger.debug("Waiting for %s to be set (timeout: %d seconds)", attribute, WAIT_TIMEOUT_SECS)
+        poll_interval = 0.5
+
+        attempts = 0
+        max_attempts = WAIT_TIMEOUT_SECS / poll_interval
+        while not getattr(self, attribute) and attempts < max_attempts:
+            time.sleep(poll_interval)
+            attempts += 1
+
+        if attempts >= max_attempts:
+            timeout_err = DriverTimeoutError(f"Timeout waiting for the '{attribute}' attribute")
+            logger.debug(timeout_err)
+            raise timeout_err
 
         logger.debug("%s set successfully", attribute)
 
@@ -195,7 +213,7 @@ class WebDriver:
 
         # Handle login errors
         if self.login_status_code != 200:
-            driver.quit()
+            self._quit_driver(driver)
             error = self._handle_login_error(login_response)
             raise error
 
@@ -219,7 +237,7 @@ class WebDriver:
             logger.debug("Login form failed to submit. Clicking login button again")
             driver.click(login_button)
 
-    def _fetch_reservations(self, driver: Driver) -> List[JSON]:
+    def _fetch_reservations(self, driver: Driver) -> list[JSON]:
         """
         Waits for the reservations request to go through and returns only reservations
         that are flights.
@@ -246,7 +264,7 @@ class WebDriver:
     def _get_needed_headers(self, request_headers: JSON) -> JSON:
         headers = {}
         for header in request_headers:
-            if re.match(r"x-api-key|x-channel-id|user-agent|^[\w-]+?-\w$", header, re.I):
+            if re.match(r"x-api-key|x-channel-id|user-agent|^[\w-]+?-\w$", header, re.IGNORECASE):
                 headers[header] = request_headers[header]
 
         return headers
@@ -264,3 +282,24 @@ class WebDriver:
             f"Successfully logged in to {account_monitor.first_name} "
             f"{account_monitor.last_name}'s account\n"
         )  # Don't log as it contains sensitive information
+
+    def _quit_driver(self, driver: Driver) -> None:
+        driver.quit()
+        self._stop_display()
+
+    def _start_display(self) -> None:
+        try:
+            self.display = Display(size=(1440, 1880), backend="xvfb")
+            self.display.start()
+
+            if self.display.is_alive():
+                logger.debug("Started virtual display successfully")
+            else:
+                logger.debug("Started virtual display but is not active")
+        except Exception as e:
+            logger.debug("Failed to start display: %s", e)
+
+    def _stop_display(self) -> None:
+        if self.display is not None:
+            self.display.stop()
+            logger.debug("Stopped virtual display successfully")

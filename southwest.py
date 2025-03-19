@@ -2,9 +2,8 @@
 """Entrypoint into the script where the arguments are passed to lib.main"""
 
 import sys
-from typing import List
 
-__version__ = "v7.5"
+__version__ = "v8.3"
 
 __doc__ = """
 Schedule a check-in:
@@ -14,12 +13,12 @@ Log into your account:
     python3 southwest.py [options] USERNAME PASSWORD
 
 Options:
-    --test-notifications Test the notification URLs configuration and exit
-    --debug-screenshots  Take screenshots of the browser for debugging purposes. Screenshots
-                         will be stored in the 'logs/' directory
-    -v, --verbose        Display debug messages
-    -h, --help           Display this help and exit
-    -V, --version        Display version information and exit
+    --test-notifications   Test the notification URLs configuration and exit
+    --debug-screenshots    Take screenshots of the browser for debugging purposes. Screenshots
+                           will be stored in the 'logs/' directory
+    -v, --verbose          Display debug messages
+    -h, --help             Display this help and exit
+    -V, --version          Display version information and exit
 
 For more information, check out https://github.com/jdholtz/auto-southwest-check-in#readme"""
 
@@ -33,7 +32,7 @@ def print_usage() -> None:
     print(__doc__)
 
 
-def check_flags(arguments: List[str]) -> None:
+def check_flags(arguments: list[str]) -> None:
     """Checks for version and help flags and exits the script on success"""
     if "--version" in arguments or "-V" in arguments:
         print_version()
@@ -43,12 +42,11 @@ def check_flags(arguments: List[str]) -> None:
         sys.exit()
 
 
-def init(arguments: List[str]) -> None:
+def init(arguments: list[str]) -> None:
     check_flags(arguments)
 
     # Imported here to avoid needing dependencies to retrieve the script's
     # version or usage
-    # pylint:disable=import-outside-toplevel
     from lib.main import main
 
     main(arguments, __version__)

@@ -8,15 +8,16 @@ __pycache__
 .gitignore
 .pre-commit-config.yaml
 .pytest_cache
+.ruff_cache
 *.md
 
 config.example.json
+config.schema.json
 config.json
 Dockerfile
 downloaded_files/
 LICENSE
 logs/
 pyproject.toml
-setup.cfg
 tests/
 venv

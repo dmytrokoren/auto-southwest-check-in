@@ -3,30 +3,19 @@ Runs the fare checker through various scenarios that could happen while checking
 """
 
 import copy
-from typing import List
 from unittest import mock
 
 import pytest
 from requests_mock.mocker import Mocker as RequestMocker
 
-from lib.checkin_scheduler import VIEW_RESERVATION_URL
 from lib.config import GlobalConfig
 from lib.fare_checker import BOOKING_URL, FareChecker
 from lib.flight import Flight
 from lib.reservation_monitor import ReservationMonitor
-from lib.utils import BASE_URL, FlightChangeError
+from lib.utils import BASE_URL, CheckFaresOption, FlightChangeError
 
-TEST_RESERVATION_URL = BASE_URL + VIEW_RESERVATION_URL + "TEST"
-CHAGE_FLIGHT_URL = BASE_URL + BOOKING_URL + "change_page"
+CHANGE_FLIGHT_URL = BASE_URL + BOOKING_URL + "change_page"
 MATCHING_FLIGHTS_URL = BASE_URL + BOOKING_URL + "matching_flights"
-
-RESERVATION_INFO = {
-    "viewReservationViewPage": {
-        "bounds": [{"fareProductDetails": {"fareProductId": "WGA"}}],
-        "_links": {"change": {"href": "change_page", "query": "test_query"}},
-        "greyBoxMessage": None,
-    }
-}
 
 CHANGE_FLIGHT_PAGE = {
     "changeFlightPage": {
@@ -57,17 +46,38 @@ FLIGHT_CARDS = [
                 "priceDifference": {"sign": "-", "amount": "4,300", "currencyCode": "PTS"},
             }
         ],
+        "stopDescription": "Nonstop",
     },
-    {"flightNumbers": "98\u200b/\u200b99"},
+    {
+        "flightNumbers": "98\u200b/\u200b99",
+        "fares": [
+            {
+                "_meta": {"fareProductId": "WGA"},
+                "priceDifference": {"sign": "-", "amount": "5,200", "currencyCode": "PTS"},
+            }
+        ],
+        "stopDescription": "1 Stop, LAX",
+    },
     {
         "flightNumbers": "100\u200b/\u200b101",
         "fares": [
             {"_meta": {"fareProductId": "TEST"}},
             {
                 "_meta": {"fareProductId": "WGA"},
-                "priceDifference": {"sign": "-", "amount": "4,300", "currencyCode": "PTS"},
+                "priceDifference": {"sign": "-", "amount": "3,600", "currencyCode": "PTS"},
             },
         ],
+        "stopDescription": "1 Stop, NYC",
+    },
+    {
+        "flightNumbers": "102",
+        "fares": [
+            {
+                "_meta": {"fareProductId": "WGA"},
+                "priceDifference": {"sign": "-", "amount": "4,800", "currencyCode": "PTS"},
+            }
+        ],
+        "stopDescription": "Nonstop",
     },
 ]
 
@@ -92,35 +102,40 @@ def flight() -> Flight:
         "departureAirport": {"code": "LAX", "name": "test_outbound"},
         "departureDate": "2021-12-06",
         "departureTime": "14:40",
-        "flights": [{"number": "100"}, {"number": "101"}],
+        "flights": [{"number": "WN100"}, {"number": "WN101"}],
+        "fareProductDetails": {"fareProductId": "WGA"},
     }
-    return Flight(flight_info, "TEST")
+
+    reservation_info = {
+        "bounds": [flight_info],
+        "_links": {"change": {"href": "change_page", "query": "test_query"}},
+        "greyBoxMessage": None,
+    }
+    return Flight(flight_info, reservation_info, "TEST")
 
 
-def test_fare_drop_outbound(
+def test_fare_drop_outbound_same_flight(
     requests_mock: RequestMocker, monitor: ReservationMonitor, flight: Flight
 ) -> None:
-    requests_mock.get(TEST_RESERVATION_URL, [{"json": RESERVATION_INFO, "status_code": 200}])
-    requests_mock.get(CHAGE_FLIGHT_URL, [{"json": CHANGE_FLIGHT_PAGE, "status_code": 200}])
+    requests_mock.get(CHANGE_FLIGHT_URL, [{"json": CHANGE_FLIGHT_PAGE, "status_code": 200}])
     requests_mock.post(MATCHING_FLIGHTS_URL, [{"json": MATCHING_FLIGHTS, "status_code": 200}])
 
     fare_checker = FareChecker(monitor)
     fare_checker.check_flight_price(flight)
 
-    monitor.notification_handler.lower_fare.assert_called_once_with(flight, "-4300 PTS")
+    monitor.notification_handler.lower_fare.assert_called_once_with(flight, "-3,600 PTS")
 
 
-def test_fare_drop_inbound(
+def test_fare_drop_inbound_same_flight(
     requests_mock: RequestMocker, monitor: ReservationMonitor, flight: Flight
 ) -> None:
     flight.flight_number = "97"
 
-    bounds = [
-        {"fareProductDetails": {"fareProductId": "TEST"}},
-        {"fareProductDetails": {"fareProductId": "WGA"}},
-    ]
-    reservation_info = copy.deepcopy(RESERVATION_INFO)
-    reservation_info["viewReservationViewPage"]["bounds"] = bounds
+    flight_info = copy.deepcopy(flight.reservation_info["bounds"][0])
+    # Changing the outbound flight's fare to an invalid type will safeguard against the
+    # outbound flight being looked at instead of the inbound
+    flight_info["fareProductDetails"] = {"fareProductId": "TEST"}
+    flight.reservation_info["bounds"].insert(0, flight_info)
 
     flight_page = copy.deepcopy(CHANGE_FLIGHT_PAGE)
     page_info = flight_page["changeFlightPage"]
@@ -137,17 +152,41 @@ def test_fare_drop_inbound(
     matching_flights = copy.deepcopy(MATCHING_FLIGHTS)
     matching_flights["changeShoppingPage"]["flights"] = {"inboundPage": {"cards": FLIGHT_CARDS}}
 
-    requests_mock.get(TEST_RESERVATION_URL, [{"json": reservation_info, "status_code": 200}])
-    requests_mock.get(CHAGE_FLIGHT_URL, [{"json": flight_page, "status_code": 200}])
+    requests_mock.get(CHANGE_FLIGHT_URL, [{"json": flight_page, "status_code": 200}])
     requests_mock.post(MATCHING_FLIGHTS_URL, [{"json": matching_flights, "status_code": 200}])
 
     fare_checker = FareChecker(monitor)
     fare_checker.check_flight_price(flight)
 
-    monitor.notification_handler.lower_fare.assert_called_once_with(flight, "-4300 PTS")
+    monitor.notification_handler.lower_fare.assert_called_once_with(flight, "-4,300 PTS")
 
 
-@pytest.mark.parametrize(["amount", "sign"], [("1,000", "+"), ("1", "-"), ("0", None)])
+@pytest.mark.parametrize(
+    ("check_fares_option", "low_fare"),
+    [
+        (CheckFaresOption.SAME_FLIGHT, "-3,600 PTS"),
+        (CheckFaresOption.SAME_DAY_NONSTOP, "-4,800 PTS"),
+        (CheckFaresOption.SAME_DAY, "-5,200 PTS"),
+    ],
+)
+def test_fare_drop_with_filter(
+    requests_mock: RequestMocker,
+    monitor: ReservationMonitor,
+    flight: Flight,
+    check_fares_option: CheckFaresOption,
+    low_fare: str,
+) -> None:
+    requests_mock.get(CHANGE_FLIGHT_URL, [{"json": CHANGE_FLIGHT_PAGE, "status_code": 200}])
+    requests_mock.post(MATCHING_FLIGHTS_URL, [{"json": MATCHING_FLIGHTS, "status_code": 200}])
+
+    monitor.config.check_fares = check_fares_option
+    fare_checker = FareChecker(monitor)
+    fare_checker.check_flight_price(flight)
+
+    monitor.notification_handler.lower_fare.assert_called_once_with(flight, low_fare)
+
+
+@pytest.mark.parametrize(("amount", "sign"), [("1,000", None), ("1", "-"), ("0", None)])
 def test_no_fare_drop(
     requests_mock: RequestMocker,
     monitor: ReservationMonitor,
@@ -158,13 +197,15 @@ def test_no_fare_drop(
     flights = copy.deepcopy(FLIGHT_CARDS)
     fare = flights[2]["fares"][1]["priceDifference"]
     fare["amount"] = amount
-    fare["sign"] = sign
+    if sign:
+        fare["sign"] = sign
+    else:
+        fare.pop("sign")
 
     matching_flights = copy.deepcopy(MATCHING_FLIGHTS)
     matching_flights["changeShoppingPage"]["flights"]["outboundPage"]["cards"] = flights
 
-    requests_mock.get(TEST_RESERVATION_URL, [{"json": RESERVATION_INFO, "status_code": 200}])
-    requests_mock.get(CHAGE_FLIGHT_URL, [{"json": CHANGE_FLIGHT_PAGE, "status_code": 200}])
+    requests_mock.get(CHANGE_FLIGHT_URL, [{"json": CHANGE_FLIGHT_PAGE, "status_code": 200}])
     requests_mock.post(MATCHING_FLIGHTS_URL, [{"json": matching_flights, "status_code": 200}])
 
     fare_checker = FareChecker(monitor)
@@ -173,14 +214,9 @@ def test_no_fare_drop(
     monitor.notification_handler.lower_fare.assert_not_called()
 
 
-def test_flight_error_with_companion(
-    requests_mock: RequestMocker, monitor: ReservationMonitor, flight: Flight
-) -> None:
-    reservation_info = copy.deepcopy(RESERVATION_INFO)
+def test_flight_error_with_companion(monitor: ReservationMonitor, flight: Flight) -> None:
     message = {"body": "You must first cancel the associated companion reservation."}
-    reservation_info["viewReservationViewPage"]["greyBoxMessage"] = message
-
-    requests_mock.get(TEST_RESERVATION_URL, [{"json": reservation_info, "status_code": 200}])
+    flight.reservation_info["greyBoxMessage"] = message
 
     fare_checker = FareChecker(monitor)
     with pytest.raises(FlightChangeError):
@@ -188,12 +224,9 @@ def test_flight_error_with_companion(
 
 
 def test_flight_error_when_no_change_link_exists(
-    requests_mock: RequestMocker, monitor: ReservationMonitor, flight: Flight
+    monitor: ReservationMonitor, flight: Flight
 ) -> None:
-    reservation_info = copy.deepcopy(RESERVATION_INFO)
-    reservation_info["viewReservationViewPage"]["_links"]["change"] = None
-
-    requests_mock.get(TEST_RESERVATION_URL, [{"json": reservation_info, "status_code": 200}])
+    flight.reservation_info["_links"]["change"] = None
 
     fare_checker = FareChecker(monitor)
     with pytest.raises(FlightChangeError):
@@ -204,7 +237,7 @@ def test_flight_error_when_no_change_link_exists(
     "fare", [None, [{"_meta": {"fareProductId": "TEST"}}], [{"_meta": {"fareProductId": "WGA"}}]]
 )
 def test_unavailable_fares(
-    requests_mock: RequestMocker, monitor: ReservationMonitor, flight: Flight, fare: List
+    requests_mock: RequestMocker, monitor: ReservationMonitor, flight: Flight, fare: list
 ) -> None:
     flights = copy.deepcopy(FLIGHT_CARDS)
     flights[2]["fares"] = fare
@@ -212,8 +245,7 @@ def test_unavailable_fares(
     matching_flights = copy.deepcopy(MATCHING_FLIGHTS)
     matching_flights["changeShoppingPage"]["flights"]["outboundPage"]["cards"] = flights
 
-    requests_mock.get(TEST_RESERVATION_URL, [{"json": RESERVATION_INFO, "status_code": 200}])
-    requests_mock.get(CHAGE_FLIGHT_URL, [{"json": CHANGE_FLIGHT_PAGE, "status_code": 200}])
+    requests_mock.get(CHANGE_FLIGHT_URL, [{"json": CHANGE_FLIGHT_PAGE, "status_code": 200}])
     requests_mock.post(MATCHING_FLIGHTS_URL, [{"json": matching_flights, "status_code": 200}])
 
     fare_checker = FareChecker(monitor)

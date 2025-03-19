@@ -1,18 +1,33 @@
+from __future__ import annotations
+
 import multiprocessing
 import sys
 import time
-from datetime import datetime
-from typing import Any, Dict, List, Tuple, Union
+from typing import TYPE_CHECKING, Any
 
 from .checkin_scheduler import CheckInScheduler
-from .config import AccountConfig, ReservationConfig
 from .fare_checker import FareChecker
 from .log import get_logger
 from .notification_handler import NotificationHandler
-from .utils import FlightChangeError, LoginError, RequestError, get_current_time
+from .utils import (
+    CheckFaresOption,
+    DriverTimeoutError,
+    FlightChangeError,
+    LoginError,
+    RequestError,
+    get_current_time,
+)
 from .webdriver import WebDriver
 
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from .config import AccountConfig, ReservationConfig
+
 TOO_MANY_REQUESTS_CODE = 429
+INTERNAL_SERVER_ERROR_CODE = 500
+
+RETRY_WAIT_SECONDS = 20
 
 logger = get_logger(__name__)
 
@@ -24,7 +39,9 @@ class ReservationMonitor:
     """
 
     def __init__(
-        self, config: Union[AccountConfig, ReservationConfig], lock: multiprocessing.Lock = None
+        self,
+        config: AccountConfig | ReservationConfig,
+        lock: multiprocessing.Lock | None = None,
     ) -> None:
         self.first_name = config.first_name
         self.last_name = config.last_name
@@ -50,45 +67,59 @@ class ReservationMonitor:
                 self._stop_monitoring()
 
     def _monitor(self) -> None:
-        """
-        Check for reservation changes and lower fares every X hours (retrieval interval).
-        Will exit when no more flights are scheduled for check-in.
-        """
-        reservation = {"confirmationNumber": self.config.confirmation_number}
-
+        """Continuously performs checks every X hours (the retrieval interval)"""
         while True:
             time_before = get_current_time()
 
+            # Acquire a lock to prevent concurrency issues with the webdriver
             logger.debug("Acquiring lock...")
             with self.lock:
                 logger.debug("Lock acquired")
 
-                # Ensure there are valid headers
-                self.checkin_scheduler.refresh_headers()
-
-                # Schedule the reservations every time in case a flight is changed or cancelled
-                self._schedule_reservations([reservation])
-
-                if len(self.checkin_scheduler.flights) <= 0:
-                    logger.debug("No more flights are scheduled for check-in. Exiting...")
+                should_exit = self._check()
+                if should_exit:
+                    logger.debug("Stopping monitoring")
                     break
 
-                self._check_flight_fares()
-
                 if self.config.retrieval_interval <= 0:
-                    logger.debug("Reservation monitoring is disabled as retrieval interval is 0")
+                    logger.debug("Monitoring is disabled as retrieval interval is 0")
                     break
 
             logger.debug("Lock released")
             self._smart_sleep(time_before)
 
-    def _schedule_reservations(self, reservations: List[Dict[str, Any]]) -> None:
+    def _check(self) -> bool:
+        """
+        Check for reservation changes and lower fares. Returns true if future checks should not be
+        performed (e.g. no more flights are scheduled to check in).
+        """
+        reservation = {"confirmationNumber": self.config.confirmation_number}
+
+        # Ensure there are valid headers
+        try:
+            self.checkin_scheduler.refresh_headers()
+        except DriverTimeoutError:
+            logger.warning("Timeout while refreshing headers. Skipping reservation retrieval")
+            self.notification_handler.timeout_during_retrieval("reservation")
+            return False
+
+        # Schedule the reservations every time in case a flight is changed or cancelled
+        self._schedule_reservations([reservation])
+
+        if len(self.checkin_scheduler.flights) <= 0:
+            logger.debug("No more flights are scheduled for check-in. Exiting...")
+            return True
+
+        self._check_flight_fares()
+        return False
+
+    def _schedule_reservations(self, reservations: list[dict[str, Any]]) -> None:
         logger.debug("Scheduling flight check-ins for %d reservations", len(reservations))
         confirmation_numbers = [reservation["confirmationNumber"] for reservation in reservations]
         self.checkin_scheduler.process_reservations(confirmation_numbers)
 
     def _check_flight_fares(self) -> None:
-        if not self.config.check_fares:
+        if self.config.check_fares == CheckFaresOption.NO:
             return
 
         flights = self.checkin_scheduler.flights
@@ -158,58 +189,77 @@ class AccountMonitor(ReservationMonitor):
         self.username = config.username
         self.password = config.password
 
-    def _monitor(self) -> None:
+    def _check(self) -> bool:
         """
-        Check for newly booked reservations for the account every X hours (retrieval interval).
+        Check for newly booked reservations for the account. Returns true if future checks should
+        not be performed.
         """
-        while True:
-            time_before = get_current_time()
+        reservations, skip_scheduling = self._get_reservations()
 
-            logger.debug("Acquiring lock...")
-            with self.lock:
-                logger.debug("Lock acquired")
-                reservations, skip_scheduling = self._get_reservations()
+        if not skip_scheduling:
+            self._schedule_reservations(reservations)
+            self._check_flight_fares()
 
-                if not skip_scheduling:
-                    self._schedule_reservations(reservations)
-                    self._check_flight_fares()
+        # There are currently no scenarios where future checks should not be performed within
+        # this scope
+        return False
 
-                if self.config.retrieval_interval <= 0:
-                    logger.debug("Account monitoring is disabled as retrieval interval is 0")
-                    break
-
-            logger.debug("Lock released")
-            self._smart_sleep(time_before)
-
-    def _get_reservations(self) -> Tuple[List[Dict[str, Any]], bool]:
+    def _get_reservations(self, max_retries: int = 1) -> tuple[list[dict[str, Any]], bool]:
         """
-        Returns a list of reservations and a boolean indicating if reservation
-        scheduling should be skipped.
+        Attempts to retrieve a list of reservations and returns a tuple containing the list
+        of reservations and a boolean indicating whether reservation scheduling should be skipped.
 
-        Reservation scheduling will be skipped if a Too Many Requests error is encountered
-        because new headers might not be valid and a list of reservations could not be retrieved.
+        The method will retry fetching reservations once in case of a timeout
+        or a Too Many Requests error. If the retry fails, reservation scheduling will be
+        skipped until the next scheduled attempt.
         """
-        logger.debug("Retrieving reservations for account")
-        webdriver = WebDriver(self.checkin_scheduler)
+        logger.debug("Retrieving reservations for account (max retries: %d)", max_retries)
 
-        try:
-            reservations = webdriver.get_reservations(self)
-        except LoginError as err:
-            if err.status_code == TOO_MANY_REQUESTS_CODE:
-                # Don't exit when a Too Many Requests error happens. Instead, just skip the
-                # retrieval until the next time.
-                logger.warning(
-                    "Encountered a Too Many Requests error while logging in. Skipping reservation "
-                    "retrieval"
+        for attempt in range(max_retries + 1):
+            webdriver = WebDriver(self.checkin_scheduler)
+
+            try:
+                reservations = webdriver.get_reservations(self)
+                logger.debug(
+                    "Successfully retrieved %d reservations after %d attempts",
+                    len(reservations),
+                    attempt + 1,
                 )
-                return [], True
+                return reservations, False
 
-            logger.debug("Error logging in. %s. Exiting", err)
-            self.notification_handler.failed_login(err)
-            sys.exit(1)
+            except DriverTimeoutError:
+                if attempt < max_retries:
+                    logger.debug("Timeout while retrieving reservations during login. Retrying")
+                    logger.debug("Waiting for %d seconds before retrying", RETRY_WAIT_SECONDS)
+                    time.sleep(RETRY_WAIT_SECONDS)
+                else:
+                    logger.debug(
+                        "Timeout persisted after %d retries. Skipping reservation retrieval",
+                        max_retries,
+                    )
+                    self.notification_handler.timeout_during_retrieval("account")
 
-        logger.debug("Successfully retrieved %d reservations", len(reservations))
-        return reservations, False
+            except LoginError as err:
+                if err.status_code in [TOO_MANY_REQUESTS_CODE, INTERNAL_SERVER_ERROR_CODE]:
+                    if attempt < max_retries:
+                        logger.debug(
+                            "Encountered an error (status: %d) while logging in. Retrying",
+                            err.status_code,
+                        )
+                        logger.debug("Waiting for %d seconds before retrying", RETRY_WAIT_SECONDS)
+                        time.sleep(RETRY_WAIT_SECONDS)
+                    else:
+                        logger.debug(
+                            "Error (status: %d) persists. Skipping reservation retrieval",
+                            err.status_code,
+                        )
+                        self.notification_handler.too_many_requests_during_login()
+                else:
+                    logger.debug("Error logging in. %s. Exiting", err)
+                    self.notification_handler.failed_login(err)
+                    sys.exit(1)
+
+        return [], True
 
     def _stop_monitoring(self) -> None:
         print(f"\nStopping monitoring for account with username {self.username}")

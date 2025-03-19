@@ -4,7 +4,7 @@ are set, errors are handled, and integration with the webdriver works.
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from multiprocessing import Lock
 from unittest import mock
 
@@ -57,9 +57,11 @@ def test_flight_is_scheduled_checks_in_and_departs(
     requests_mock: RequestMocker, mocker: MockerFixture
 ) -> None:
     tz_data = {"LAX": "America/Los_Angeles"}
-
     mocker.patch("pathlib.Path.read_text", return_value=json.dumps(tz_data))
-    mocker.patch("lib.reservation_monitor.get_current_time", return_value=datetime(2020, 10, 5))
+
+    current_utc_time = datetime(2020, 10, 5, 18, 29, tzinfo=timezone.utc)
+    mocker.patch("lib.reservation_monitor.get_current_time", return_value=current_utc_time)
+
     mock_process = mocker.patch("lib.checkin_handler.Process").return_value
     mock_new_flights_notification = mocker.patch(
         "lib.notification_handler.NotificationHandler.new_flights"
@@ -75,8 +77,7 @@ def test_flight_is_scheduled_checks_in_and_departs(
         [{"confirmationNumber": "TEST", "firstName": "Berkant", "lastName": "Marika"}]
     )
 
-    def mock_get_driver(self) -> mock.Mock:
-        # pylint: disable-next=protected-access
+    def mock_get_driver(self: WebDriver) -> mock.Mock:
         self.checkin_scheduler.headers = self._get_needed_headers(ALL_HEADERS)
         self.headers_set = True
         return mocker.patch("lib.webdriver.Driver")
@@ -91,7 +92,7 @@ def test_flight_is_scheduled_checks_in_and_departs(
                     "departureAirport": {"code": "LAX", "name": "test_outbound"},
                     "departureDate": "2020-10-13",
                     "departureTime": "14:40",
-                    "flights": [{"number": "100"}, {"number": "101"}],
+                    "flights": [{"number": "WN100"}, {"number": "WN101"}],
                 },
             ],
         }
@@ -101,10 +102,10 @@ def test_flight_is_scheduled_checks_in_and_departs(
     # a full round-trip flight)
     mocker.patch(
         "lib.checkin_scheduler.get_current_time",
-        side_effect=[datetime(2020, 10, 5, 18, 29), datetime(2020, 10, 14, 18, 29)],
+        side_effect=[current_utc_time, datetime(2020, 10, 14, 18, 29, tzinfo=timezone.utc)],
     )
 
-    requests_mock.get(
+    requests_mock.post(
         TEST_RESERVATION_URL,
         [{"json": reservation1, "status_code": 200}, {"json": reservation1, "status_code": 200}],
     )
@@ -138,12 +139,13 @@ def test_account_schedules_new_flights(requests_mock: RequestMocker, mocker: Moc
     tz_data = {"LAX": "America/Los_Angeles", "SYD": "Australia/Sydney"}
     mocker.patch("pathlib.Path.read_text", return_value=json.dumps(tz_data))
 
-    mocker.patch("lib.reservation_monitor.get_current_time", return_value=datetime(2020, 10, 10))
-    mocker.patch("lib.checkin_scheduler.get_current_time", return_value=datetime(2020, 10, 10))
+    current_utc_time = datetime(2020, 10, 10, tzinfo=timezone.utc)
+    mocker.patch("lib.reservation_monitor.get_current_time", return_value=current_utc_time)
+    mocker.patch("lib.checkin_scheduler.get_current_time", return_value=current_utc_time)
     mocker.patch("lib.webdriver.seleniumbase_actions.wait_for_element_not_visible")
     mock_process = mocker.patch("lib.checkin_handler.Process").return_value
     # Raise a StopIteration to prevent an infinite loop
-    mocker.patch("time.sleep", side_effect=[None, None, StopIteration])
+    mocker.patch("time.sleep", side_effect=[None, None, None, None, None, StopIteration])
 
     # Is checked in a separate integration test
     mock_check_flight_price = mocker.patch("lib.fare_checker.FareChecker.check_flight_price")
@@ -164,7 +166,7 @@ def test_account_schedules_new_flights(requests_mock: RequestMocker, mocker: Moc
 
     login_attempts = 0
 
-    def mock_get_driver(self) -> mock.Mock:
+    def mock_get_driver(self: WebDriver) -> mock.Mock:
         """
         Adds login and trips responses. The second login request will be a 429 to test
         that the error is handled correctly.
@@ -172,7 +174,6 @@ def test_account_schedules_new_flights(requests_mock: RequestMocker, mocker: Moc
         nonlocal login_attempts
         login_attempts += 1
 
-        # pylint: disable-next=protected-access
         self.checkin_scheduler.headers = self._get_needed_headers(ALL_HEADERS)
         self.headers_set = True
 
@@ -199,20 +200,20 @@ def test_account_schedules_new_flights(requests_mock: RequestMocker, mocker: Moc
                     "departureAirport": {"code": "LAX", "name": "test_outbound"},
                     "departureDate": "2020-10-13",
                     "departureTime": "14:40",
-                    "flights": [{"number": "100"}],
+                    "flights": [{"number": "WN100"}],
                 },
                 {
                     "arrivalAirport": {"name": "test_outbound", "country": None},
                     "departureAirport": {"code": "SYD", "name": "test_inbound"},
                     "departureDate": "2020-10-16",
                     "departureTime": "07:20",
-                    "flights": [{"number": "101"}],
+                    "flights": [{"number": "WN101"}],
                 },
             ],
         }
     }
 
-    requests_mock.get(TEST_RESERVATION_URL, [{"json": reservation, "status_code": 200}])
+    requests_mock.post(TEST_RESERVATION_URL, [{"json": reservation, "status_code": 200}])
 
     monitor = AccountMonitor(config.accounts[0], Lock())
     with pytest.raises(StopIteration):
