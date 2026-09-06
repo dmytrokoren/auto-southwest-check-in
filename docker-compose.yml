@@ -1,9 +1,7 @@
 services:
   auto-southwest:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: auto-southwest-check-in-local
+    image: dmytrokoren/auto-southwest-check-in:develop
+    command: ["--verbose"]
     container_name: auto-southwest
     restart: unless-stopped
     init: true
