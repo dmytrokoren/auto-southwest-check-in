@@ -128,6 +128,40 @@ def test_do_request_correctly_gets_data(requests_mock: RequestMocker) -> None:
     assert last_request.headers["header"] == "test"
 
 
+def test_do_request_impersonates_chrome_in_docker(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AUTO_SOUTHWEST_CHECK_IN_DOCKER", "1")
+    mock_session = mocker.patch("lib.utils._get_browser_session").return_value
+
+    utils._do_request("POST", utils.BASE_URL + "test", {"header": "test"}, {"test": "json"})
+
+    mock_session.post.assert_called_once_with(
+        utils.BASE_URL + "test",
+        headers={"header": "test"},
+        json={"test": "json"},
+        impersonate="chrome",
+        default_headers=False,
+    )
+
+
+def test_do_request_get_impersonates_chrome_in_docker(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AUTO_SOUTHWEST_CHECK_IN_DOCKER", "1")
+    mock_session = mocker.patch("lib.utils._get_browser_session").return_value
+
+    utils._do_request("GET", utils.BASE_URL + "test", {"header": "test"}, {"test": "params"})
+
+    mock_session.get.assert_called_once_with(
+        utils.BASE_URL + "test",
+        headers={"header": "test"},
+        params={"test": "params"},
+        impersonate="chrome",
+        default_headers=False,
+    )
+
+
 @pytest.mark.parametrize(
     ("code", "error"),
     [

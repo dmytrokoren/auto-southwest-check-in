@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import socket
 import time
@@ -10,6 +11,7 @@ from typing import Any
 
 import ntplib
 import requests
+from curl_cffi import requests as browser_requests
 
 from .log import get_logger
 
@@ -21,6 +23,34 @@ NTP_SERVER = "time.nist.gov"
 NTP_BACKUP_SERVER = "time.cloudflare.com"
 
 logger = get_logger(__name__)
+
+# Keep one Chrome-impersonating connection pool per process. Reusing the session
+# preserves cookies and TLS/HTTP connection state between reservation and fare
+# calls instead of presenting Southwest with a new client on every request.
+_browser_session: browser_requests.Session | None = None
+_browser_session_pid: int | None = None
+
+
+def _get_browser_session() -> browser_requests.Session:
+    """Return a reusable session without sharing live connections across a fork."""
+    global _browser_session, _browser_session_pid
+
+    current_pid = os.getpid()
+    if _browser_session is None or _browser_session_pid != current_pid:
+        _browser_session = browser_requests.Session()
+        _browser_session_pid = current_pid
+
+    return _browser_session
+
+
+def reset_browser_session() -> None:
+    """Discard Docker HTTP state when Chrome generates a new header identity."""
+    global _browser_session, _browser_session_pid
+
+    if _browser_session is not None:
+        _browser_session.close()
+    _browser_session = None
+    _browser_session_pid = None
 
 
 def random_sleep_duration(min_duration: float, max_duration: float) -> float:
@@ -34,6 +64,7 @@ def make_request(
     info: JSON,
     max_attempts: int = 20,
     random_sleep: bool = True,
+    gentle_403: bool = False,
 ) -> JSON:
     """
     Makes a request to the Southwest servers. For increased reliability, the request is performed
@@ -47,20 +78,26 @@ def make_request(
     attempts = 0
     while attempts < max_attempts:
         attempts += 1
+        status_code = None
 
         try:
             response = _do_request(method, url, headers, info)
+            status_code = response.status_code
             if response.status_code == 200:
                 logger.debug("Successfully made request after %d attempts", attempts)
                 return response.json()
 
             response_body = response.content.decode()
             error_msg = f"{response.reason} ({response.status_code})"
-        except requests.RequestException as err:
+        except (requests.RequestException, browser_requests.RequestsError) as err:
             response_body = ""
             error_msg = str(err)
 
-        error = RequestError(error_msg, response_body)
+        error = RequestError(
+            error_msg,
+            response_body,
+            status_code,
+        )
 
         try:
             _handle_southwest_error_code(error)
@@ -69,7 +106,11 @@ def make_request(
             error = err
             break
 
-        sleep_time = random_sleep_duration(1, 3) if random_sleep else 0.5
+        if gentle_403 and status_code == 403:
+            # Keep retries paced without adding long delays to a fare-check cycle.
+            sleep_time = random_sleep_duration(2, 5)
+        else:
+            sleep_time = random_sleep_duration(1, 3) if random_sleep else 0.5
         logger.debug(
             "Request error on attempt %d: %s. Sleeping for %.2f seconds until next attempt",
             attempts,
@@ -83,7 +124,19 @@ def make_request(
     raise error
 
 
-def _do_request(method: str, url: str, headers: JSON, info: JSON) -> requests.Response:
+def _do_request(method: str, url: str, headers: JSON, info: JSON) -> Any:
+    if os.environ.get("AUTO_SOUTHWEST_CHECK_IN_DOCKER") == "1":
+        browser_session = _get_browser_session()
+        request_args = {
+            "headers": headers,
+            "impersonate": "chrome",
+            "default_headers": False,
+        }
+        if method.upper() == "POST":
+            return browser_session.post(url, json=info, **request_args)
+
+        return browser_session.get(url, params=info, **request_args)
+
     if method.upper() == "POST":
         response = requests.post(url, headers=headers, json=info)
     else:
@@ -149,8 +202,12 @@ def get_current_time() -> datetime:
 class RequestError(Exception):
     """A custom exception when a request fails"""
 
-    def __init__(self, message: str, response_body: str = "") -> None:
+    def __init__(
+        self, message: str, response_body: str = "", status_code: int | None = None
+    ) -> None:
         super().__init__(message)
+
+        self.status_code = status_code
 
         try:
             response_json = json.loads(response_body)

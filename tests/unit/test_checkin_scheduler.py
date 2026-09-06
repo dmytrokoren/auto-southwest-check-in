@@ -12,7 +12,7 @@ from lib.config import ReservationConfig
 from lib.flight import Flight
 from lib.notification_handler import NotificationHandler
 from lib.reservation_monitor import ReservationMonitor
-from lib.utils import RequestError, SouthwestErrorCode
+from lib.utils import DriverTimeoutError, RequestError, SouthwestErrorCode
 from lib.webdriver import WebDriver
 
 
@@ -53,9 +53,11 @@ class TestCheckInScheduler:
 
     def test_refresh_headers_sets_new_headers(self, mocker: MockerFixture) -> None:
         mock_webdriver_set_headers = mocker.patch.object(WebDriver, "set_headers")
+        mock_reset_browser_session = mocker.patch("lib.checkin_scheduler.reset_browser_session")
 
         self.scheduler.refresh_headers()
         mock_webdriver_set_headers.assert_called_once()
+        mock_reset_browser_session.assert_called_once()
 
     def test_get_flights_retrieves_all_flights_under_reservation(
         self, mocker: MockerFixture, test_flights: list[Flight]
@@ -110,6 +112,59 @@ class TestCheckInScheduler:
 
         reservation_info = self.scheduler._get_reservation_info("flight1")
         assert reservation_info == {"bounds": [{"test": "reservation"}]}
+
+    def test_get_reservation_info_refreshes_headers_after_forbidden(
+        self, mocker: MockerFixture
+    ) -> None:
+        reservation_content = {"viewReservationViewPage": {"bounds": []}}
+        forbidden = RequestError("Forbidden (403)", status_code=403)
+        mock_request = mocker.patch(
+            "lib.checkin_scheduler.make_request",
+            side_effect=[forbidden, reservation_content],
+        )
+        mock_refresh = mocker.patch.object(self.scheduler, "refresh_headers")
+
+        reservation_info = self.scheduler._get_reservation_info("flight1")
+
+        assert reservation_info == {"bounds": []}
+        assert mock_request.call_count == 2
+        mock_refresh.assert_called_once()
+
+    def test_get_reservation_info_handles_failed_retry_after_forbidden(
+        self, mocker: MockerFixture
+    ) -> None:
+        forbidden = RequestError("Forbidden (403)", status_code=403)
+        retry_error = RequestError("Forbidden (403)", status_code=403)
+        mocker.patch(
+            "lib.checkin_scheduler.make_request",
+            side_effect=[forbidden, retry_error],
+        )
+        mocker.patch.object(self.scheduler, "refresh_headers")
+        mock_failed_retrieval = mocker.patch.object(
+            self.scheduler.notification_handler, "failed_reservation_retrieval"
+        )
+
+        reservation_info = self.scheduler._get_reservation_info("flight1")
+
+        assert reservation_info == {}
+        mock_failed_retrieval.assert_called_once_with(retry_error, "flight1")
+
+    def test_get_reservation_info_handles_timeout_refreshing_forbidden_session(
+        self, mocker: MockerFixture
+    ) -> None:
+        forbidden = RequestError("Forbidden (403)", status_code=403)
+        mocker.patch("lib.checkin_scheduler.make_request", side_effect=forbidden)
+        mocker.patch.object(
+            self.scheduler, "refresh_headers", side_effect=DriverTimeoutError("timeout")
+        )
+        mock_timeout = mocker.patch.object(
+            self.scheduler.notification_handler, "timeout_during_retrieval"
+        )
+
+        reservation_info = self.scheduler._get_reservation_info("flight1")
+
+        assert reservation_info == {}
+        mock_timeout.assert_called_once_with("reservation")
 
     def test_get_reservation_info_sends_error_notification_when_reservation_not_found(
         self, mocker: MockerFixture

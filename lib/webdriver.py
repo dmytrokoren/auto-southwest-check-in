@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -13,7 +16,12 @@ from seleniumbase.fixtures import page_actions as seleniumbase_actions
 
 from .config import IS_DOCKER
 from .log import LOGS_DIRECTORY, get_logger
-from .utils import DriverTimeoutError, LoginError, random_sleep_duration
+from .utils import (
+    DriverTimeoutError,
+    LoginError,
+    random_sleep_duration,
+    reset_browser_session,
+)
 
 if TYPE_CHECKING:
     from .checkin_scheduler import CheckInScheduler
@@ -62,6 +70,20 @@ class WebDriver:
     https://github.com/byalextran/southwest-headers/commit/d2969306edb0976290bfa256d41badcc9698f6ed
     """
 
+    _temp_dir: str | None = None
+
+    @classmethod
+    def _get_temp_dir(cls) -> str:
+        if cls._temp_dir is None:
+            cls._temp_dir = tempfile.mkdtemp(prefix="southwest-chrome-")
+        return cls._temp_dir
+
+    @classmethod
+    def _reset_temp_dir(cls) -> None:
+        if cls._temp_dir and os.path.isdir(cls._temp_dir):
+            shutil.rmtree(cls._temp_dir)
+        cls._temp_dir = None
+
     def __init__(self, checkin_scheduler: CheckInScheduler) -> None:
         self.checkin_scheduler = checkin_scheduler
         self.headers_set = False
@@ -72,6 +94,7 @@ class WebDriver:
         self.login_request_id = None
         self.login_status_code = None
         self.trips_request_id = None
+        self.finished_request_ids: set[str] = set()
 
     def _should_take_screenshots(self) -> bool:
         """
@@ -102,7 +125,6 @@ class WebDriver:
         # Once this attribute is set, the headers have been set in the checkin_scheduler
         self._wait_for_attribute(driver, "headers_set")
         self._take_debug_screenshot(driver, "post_headers.png")
-
         self._quit_driver(driver)
 
     def get_reservations(self, account_monitor: AccountMonitor) -> list[JSON]:
@@ -117,6 +139,7 @@ class WebDriver:
         """
         driver = self._get_driver()
         driver.add_cdp_listener("Network.responseReceived", self._login_listener)
+        driver.add_cdp_listener("Network.loadingFinished", self._loading_finished_listener)
 
         # Now, load the normal website (not the mobile site) to log in and get reservations
         logger.debug("Loading Southwest login page (this may take a moment)")
@@ -137,6 +160,7 @@ class WebDriver:
         # The upcoming trips page is also loaded when we log in, so we might as well grab it
         # instead of requesting again later
         reservations = self._fetch_reservations(driver)
+        reset_browser_session()
 
         self._quit_driver(driver)
         return reservations
@@ -152,20 +176,32 @@ class WebDriver:
             # already has the correct driver
             driver_version = "keep"
 
+        # Use an isolated throwaway profile in Docker without device emulation.
+        # The captured desktop User-Agent must match curl_cffi's desktop Chrome
+        # TLS fingerprint used by subsequent API calls.
         driver = Driver(
             binary_location=browser_path,
             driver_version=driver_version,
+            user_data_dir=self._get_temp_dir() if IS_DOCKER else None,
             headed=IS_DOCKER,
             headless1=not IS_DOCKER,
             uc_cdp_events=True,
             undetectable=True,
             incognito=True,
+            locale_code="en-US",
+            mobile=False,
         )
         logger.debug("Using browser version: %s", driver.caps["browserVersion"])
 
+        if IS_DOCKER:
+            browser_timezone = os.environ.get("TZ", "America/Chicago")
+            driver.execute_cdp_cmd(
+                "Emulation.setTimezoneOverride", {"timezoneId": browser_timezone}
+            )
+            logger.debug("Using browser timezone: %s", browser_timezone)
+
         driver.add_cdp_listener("Network.requestWillBeSent", self._headers_listener)
 
-        # Load the login page to get valid headers
         logger.debug("Loading mobile Southwest login page (this may take a moment)")
         driver.get(MOBILE_LOGIN_URL)
         self._take_debug_screenshot(driver, "after_page_load.png")
@@ -178,7 +214,7 @@ class WebDriver:
         in the checkin_scheduler.
         """
         request = data["params"]["request"]
-        if request["url"] == MOBILE_HEADERS_URL:
+        if request["url"].split("?", 1)[0] == MOBILE_HEADERS_URL:
             self.checkin_scheduler.headers = self._get_needed_headers(request["headers"])
             self.headers_set = True
 
@@ -195,6 +231,10 @@ class WebDriver:
         elif response["url"] == TRIPS_URL:
             logger.debug("Upcoming trips response has been received")
             self.trips_request_id = data["params"]["requestId"]
+
+    def _loading_finished_listener(self, data: JSON) -> None:
+        """Remember when Chrome has made a response body safe to retrieve."""
+        self.finished_request_ids.add(data["params"]["requestId"])
 
     def _wait_for_attribute(self, driver: Driver, attribute: str) -> None:
         logger.debug("Waiting for %s to be set (timeout: %d seconds)", attribute, WAIT_TIMEOUT_SECS)
@@ -221,6 +261,7 @@ class WebDriver:
         """
         self._click_login_button(driver)
         self._wait_for_attribute(driver, "login_request_id")
+        self._wait_for_request_finished(driver, self.login_request_id)
         login_response = self._get_response_body(driver, self.login_request_id)
 
         # Handle login errors
@@ -254,9 +295,26 @@ class WebDriver:
         that are flights.
         """
         self._wait_for_attribute(driver, "trips_request_id")
+        self._wait_for_request_finished(driver, self.trips_request_id)
         trips_response = self._get_response_body(driver, self.trips_request_id)
         reservations = trips_response["data"]
         return reservations
+
+    def _wait_for_request_finished(self, driver: Driver, request_id: str) -> None:
+        """Wait until Chrome confirms that a network response body is complete."""
+        logger.debug("Waiting for response body to finish loading")
+        attempts = 0
+        poll_interval = 0.1
+        max_attempts = int(WAIT_TIMEOUT_SECS / poll_interval)
+        while request_id not in self.finished_request_ids and attempts < max_attempts:
+            time.sleep(poll_interval)
+            attempts += 1
+
+        if request_id not in self.finished_request_ids:
+            self._quit_driver(driver)
+            raise DriverTimeoutError("Timeout waiting for the response body to finish loading")
+
+        logger.debug("Response body finished loading")
 
     def _get_response_body(self, driver: Driver, request_id: str) -> JSON:
         response = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": request_id})
@@ -298,8 +356,12 @@ class WebDriver:
         )  # Don't log as it contains sensitive information
 
     def _quit_driver(self, driver: Driver) -> None:
-        driver.quit()
-        self._stop_display()
+        try:
+            driver.quit()
+        finally:
+            if IS_DOCKER:
+                self._reset_temp_dir()
+            self._stop_display()
 
     def _start_display(self) -> None:
         try:

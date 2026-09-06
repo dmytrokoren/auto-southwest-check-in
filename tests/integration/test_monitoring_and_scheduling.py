@@ -184,6 +184,7 @@ def test_account_schedules_new_flights(requests_mock: RequestMocker, mocker: Moc
 
         self.login_request_id = "login"
         self.trips_request_id = "trips"
+        self.finished_request_ids = {"login", "trips"}
 
         mock_driver = mocker.patch("lib.webdriver.Driver")
         mock_driver.execute_cdp_cmd.side_effect = [login_response, trips_response]

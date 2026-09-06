@@ -6,13 +6,21 @@ from typing import TYPE_CHECKING, Any
 from .checkin_handler import CheckInHandler
 from .flight import Flight
 from .log import get_logger
-from .utils import RequestError, SouthwestErrorCode, get_current_time, make_request
+from .utils import (
+    DriverTimeoutError,
+    RequestError,
+    SouthwestErrorCode,
+    get_current_time,
+    make_request,
+    reset_browser_session,
+)
 from .webdriver import WebDriver
 
 if TYPE_CHECKING:
     from .reservation_monitor import ReservationMonitor
 
 VIEW_RESERVATION_URL = "mobile-air-booking/v1/mobile-air-booking/page/view-reservation/"
+FORBIDDEN_STATUS_CODE = 403
 logger = get_logger(__name__)
 
 
@@ -46,6 +54,7 @@ class CheckInScheduler:
         logger.debug("Refreshing headers for current session")
         webdriver = WebDriver(self)
         webdriver.set_headers()
+        reset_browser_session()
 
     def _get_flights(self, confirmation_number: str) -> list[Flight]:
         """Get all flights booked on a single reservation"""
@@ -79,6 +88,21 @@ class CheckInScheduler:
             logger.debug("Retrieving reservation information")
             response = make_request("POST", site, self.headers, info)
         except RequestError as err:
+            if err.status_code == FORBIDDEN_STATUS_CODE:
+                logger.warning("Southwest rejected the current session. Refreshing it and retrying")
+                try:
+                    self.refresh_headers()
+                    response = make_request("POST", site, self.headers, info)
+                except DriverTimeoutError:
+                    logger.warning("Timed out while refreshing the rejected session")
+                    self.notification_handler.timeout_during_retrieval("reservation")
+                    return {}
+                except RequestError as retry_err:
+                    err = retry_err
+                else:
+                    logger.debug("Successfully retrieved reservation information after refresh")
+                    return response["viewReservationViewPage"]
+
             # Don't send a notification if flights have already been scheduled and all flights
             # from this reservation are old. This is how old flights are removed.
             if len(self.flights) == 0 or err.southwest_code != SouthwestErrorCode.FLIGHT_IN_PAST:

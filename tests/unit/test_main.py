@@ -16,12 +16,26 @@ def mock_config(mocker: MockerFixture) -> None:
     mocker.patch("lib.config.GlobalConfig._read_config")
 
 
-def test_get_timezone_fetches_timezone_from_request(requests_mock: RequestMocker) -> None:
+def test_get_timezone_fetches_timezone_from_request(
+    requests_mock: RequestMocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TZ", "America/Chicago")
     requests_mock.get(main.IP_TIMEZONE_URL, text="Asia/Tokyo")
     assert main.get_timezone() == "Asia/Tokyo"
 
 
-def test_get_timezone_returns_utc_when_request_fails(requests_mock: RequestMocker) -> None:
+def test_get_timezone_returns_configured_timezone_when_request_fails(
+    requests_mock: RequestMocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests_mock.get(main.IP_TIMEZONE_URL, status_code=500)
+    monkeypatch.setenv("TZ", "America/Chicago")
+    assert main.get_timezone() == "America/Chicago"
+
+
+def test_get_timezone_returns_utc_when_request_fails(
+    requests_mock: RequestMocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("TZ", raising=False)
     requests_mock.get(main.IP_TIMEZONE_URL, status_code=500)
     assert main.get_timezone() == "UTC"
 

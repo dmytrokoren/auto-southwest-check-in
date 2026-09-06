@@ -26,8 +26,9 @@ if TYPE_CHECKING:
 
 TOO_MANY_REQUESTS_CODE = 429
 INTERNAL_SERVER_ERROR_CODE = 500
+FORBIDDEN_STATUS_CODE = 403
 
-RETRY_WAIT_SECONDS = 10
+RETRY_WAIT_SECONDS = 5
 
 logger = get_logger(__name__)
 
@@ -125,7 +126,13 @@ class ReservationMonitor:
         flights = self.checkin_scheduler.flights
         logger.debug("Checking fares for %d flights", len(flights))
 
-        fare_checker = FareChecker(self)
+        self._check_flights_with_fare_checker(flights, FareChecker(self))
+
+    def _check_flights_with_fare_checker(
+        self,
+        flights: list[Any],
+        fare_checker: FareChecker,
+    ) -> None:
         for flight in flights:
             # If a fare check fails, don't completely exit. Just print the error
             # and continue
@@ -135,6 +142,13 @@ class ReservationMonitor:
                     f"Successful fare check,\nconfirmation number = {flight.confirmation_number}"
                 )
             except RequestError as err:
+                if err.status_code == FORBIDDEN_STATUS_CODE and self._retry_fare_check(flight):
+                    self.notification_handler.healthchecks_success(
+                        "Successful fare check,\n"
+                        f"confirmation number = {flight.confirmation_number}"
+                    )
+                    continue
+
                 logger.error("Requesting error during fare check. %s. Skipping...", err)
                 self.notification_handler.healthchecks_fail(
                     f"Failed fare check,\nconfirmation number = {flight.confirmation_number}"
@@ -149,6 +163,21 @@ class ReservationMonitor:
                 self.notification_handler.healthchecks_fail(
                     f"Failed fare check,\nconfirmation number = {flight.confirmation_number}"
                 )
+
+    def _retry_fare_check(self, flight: Any) -> bool:
+        logger.warning("Southwest rejected the fare-check session. Refreshing its browser headers")
+        try:
+            self.checkin_scheduler.refresh_headers()
+            FareChecker(self).check_flight_price(flight)
+        except DriverTimeoutError:
+            logger.warning("Timed out refreshing headers for the fare-check retry")
+            return False
+        except RequestError as err:
+            logger.error("Fare check still failed with refreshed browser headers: %s", err)
+            return False
+
+        logger.debug("Fare check succeeded with refreshed browser headers")
+        return True
 
     def _smart_sleep(self, previous_time: datetime) -> None:
         """
@@ -243,20 +272,29 @@ class AccountMonitor(ReservationMonitor):
                     self.notification_handler.timeout_during_retrieval("account")
 
             except LoginError as err:
-                if err.status_code in [TOO_MANY_REQUESTS_CODE, INTERNAL_SERVER_ERROR_CODE]:
+                retryable_statuses = {
+                    FORBIDDEN_STATUS_CODE,
+                    TOO_MANY_REQUESTS_CODE,
+                    INTERNAL_SERVER_ERROR_CODE,
+                }
+                if err.status_code in retryable_statuses:
                     if attempt < max_retries:
                         logger.debug(
                             "Encountered an error (status: %d) while logging in. Retrying",
                             err.status_code,
                         )
-                        logger.debug("Waiting for %d seconds before retrying", RETRY_WAIT_SECONDS)
-                        time.sleep(RETRY_WAIT_SECONDS)
+                        retry_wait = RETRY_WAIT_SECONDS
+                        logger.debug("Waiting for %d seconds before retrying", retry_wait)
+                        time.sleep(retry_wait)
                     else:
                         logger.debug(
                             "Error (status: %d) persists. Skipping reservation retrieval",
                             err.status_code,
                         )
-                        self.notification_handler.too_many_requests_during_login()
+                        if err.status_code == TOO_MANY_REQUESTS_CODE:
+                            self.notification_handler.too_many_requests_during_login()
+                        else:
+                            self.notification_handler.failed_login(err)
                 else:
                     logger.debug("Error logging in. %s. Exiting", err)
                     self.notification_handler.failed_login(err)

@@ -170,6 +170,16 @@ class TestReservationMonitor:
 
         assert mock_check_flight_price.call_count == len(self.monitor.checkin_scheduler.flights)
 
+    def test_check_flight_fares_uses_one_fare_checker(self, mocker: MockerFixture) -> None:
+        test_flight = mocker.patch("lib.flight.Flight")
+        mock_check_flight_price = mocker.patch.object(FareChecker, "check_flight_price")
+
+        self.monitor.config.check_fares = CheckFaresOption.SAME_FLIGHT
+        self.monitor.checkin_scheduler.flights = [test_flight, test_flight]
+        self.monitor._check_flight_fares()
+
+        assert mock_check_flight_price.call_count == 2
+
     @pytest.mark.parametrize("exception", [RequestError(""), FlightChangeError, Exception])
     def test_check_flight_fares_catches_error_when_checking_fares(
         self, mocker: MockerFixture, exception: Exception
@@ -184,6 +194,41 @@ class TestReservationMonitor:
         self.monitor._check_flight_fares()
 
         assert mock_check_flight_price.call_count == len(self.monitor.checkin_scheduler.flights)
+
+    def test_check_flight_fares_refreshes_and_retries_after_forbidden(
+        self, mocker: MockerFixture
+    ) -> None:
+        test_flight = mocker.patch("lib.flight.Flight")
+        forbidden = RequestError("Forbidden (403)", status_code=403)
+        mock_check_flight_price = mocker.patch.object(
+            FareChecker, "check_flight_price", side_effect=[forbidden, None]
+        )
+        mock_refresh_headers = mocker.patch.object(CheckInScheduler, "refresh_headers")
+        mock_healthchecks_success = mocker.patch.object(NotificationHandler, "healthchecks_success")
+
+        self.monitor.config.check_fares = CheckFaresOption.SAME_FLIGHT
+        self.monitor.checkin_scheduler.flights = [test_flight]
+        self.monitor._check_flight_fares()
+
+        assert mock_check_flight_price.call_count == 2
+        mock_refresh_headers.assert_called_once()
+        mock_healthchecks_success.assert_called_once()
+
+    @pytest.mark.parametrize("retry_error", [RequestError(""), DriverTimeoutError("")])
+    def test_check_flight_fares_reports_failure_when_forbidden_retry_fails(
+        self, mocker: MockerFixture, retry_error: Exception
+    ) -> None:
+        test_flight = mocker.patch("lib.flight.Flight")
+        forbidden = RequestError("Forbidden (403)", status_code=403)
+        mocker.patch.object(FareChecker, "check_flight_price", side_effect=forbidden)
+        mocker.patch.object(CheckInScheduler, "refresh_headers", side_effect=retry_error)
+        mock_healthchecks_fail = mocker.patch.object(NotificationHandler, "healthchecks_fail")
+
+        self.monitor.config.check_fares = CheckFaresOption.SAME_FLIGHT
+        self.monitor.checkin_scheduler.flights = [test_flight]
+        self.monitor._check_flight_fares()
+
+        mock_healthchecks_fail.assert_called_once()
 
     def test_smart_sleep_sleeps_for_correct_time(self, mocker: MockerFixture) -> None:
         mock_sleep = mocker.patch("time.sleep")

@@ -74,7 +74,7 @@ class TestWebDriver:
 
         mock_wait_for_attribute.assert_called_once()
         mock_wait_for_login.assert_called_once()
-        mock_chrome.add_cdp_listener.assert_called_once()
+        assert mock_chrome.add_cdp_listener.call_count == 2
         # Ensure the driver navigates to the normal website to fetch reservations
         mock_chrome.get.assert_called_once()
         mock_chrome.quit.assert_called_once()
@@ -175,6 +175,7 @@ class TestWebDriver:
     ) -> None:
         mocker.patch.object(WebDriver, "_click_login_button")
         mocker.patch.object(WebDriver, "_wait_for_attribute")
+        mocker.patch.object(WebDriver, "_wait_for_request_finished")
         mocker.patch.object(WebDriver, "_get_response_body")
         mocker.patch.object(WebDriver, "_handle_login_error", return_value=LoginError("", 400))
         mock_set_account_name = mocker.patch.object(WebDriver, "_set_account_name")
@@ -189,6 +190,7 @@ class TestWebDriver:
     def test_wait_for_login_sets_account_name(self, mocker: MockerFixture) -> None:
         mocker.patch.object(WebDriver, "_click_login_button")
         mocker.patch.object(WebDriver, "_wait_for_attribute")
+        mocker.patch.object(WebDriver, "_wait_for_request_finished")
         mocker.patch.object(WebDriver, "_get_response_body")
         mock_set_account_name = mocker.patch.object(WebDriver, "_set_account_name")
 
@@ -234,6 +236,7 @@ class TestWebDriver:
         trips_response = {"data": ["flight1", "flight2"]}
 
         mocker.patch.object(WebDriver, "_wait_for_attribute")
+        mocker.patch.object(WebDriver, "_wait_for_request_finished")
         mocker.patch.object(WebDriver, "_get_response_body", return_value=trips_response)
 
         assert self.driver._fetch_reservations(None) == ["flight1", "flight2"]

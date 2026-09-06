@@ -20,15 +20,18 @@ logger = log.get_logger(__name__)
 
 
 def get_timezone() -> str:
-    """Fetches the local timezone based on the system's IP address"""
+    """Fetch the timezone based on IP, falling back to the configured timezone."""
     try:
         logger.debug("Fetching local timezone")
         response = requests.get(IP_TIMEZONE_URL, timeout=5)
         response.raise_for_status()
         return response.text.strip()
     except requests.RequestException:
-        logger.debug("Timezone request failed, reverting to UTC")
-        return "UTC"
+        configured_timezone = os.environ.get("TZ", "UTC")
+        logger.debug(
+            "Timezone request failed, reverting to configured timezone %s", configured_timezone
+        )
+        return configured_timezone
 
 
 def test_notifications(config: GlobalConfig) -> None:
