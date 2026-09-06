@@ -1,0 +1,14 @@
+services:
+  auto-southwest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: auto-southwest-check-in-local
+    container_name: auto-southwest
+    restart: unless-stopped
+    init: true
+    shm_size: "2gb"
+    environment:
+      TZ: "${TZ:-America/Chicago}"
+    volumes:
+      - ./config.json:/app/config.json:ro
